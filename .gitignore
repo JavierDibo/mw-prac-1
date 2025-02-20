@@ -4,5 +4,4 @@ cleaned_edges.csv
 edges.csv
 nodes.csv
 .gitignore
-config.ini
 .idea
