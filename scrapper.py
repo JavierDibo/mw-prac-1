@@ -7,7 +7,7 @@ import logging
 import configparser
 
 # Configure logging
-logging.basicConfig(level=logging.WARN, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load configuration from config.ini
 config = configparser.ConfigParser()
