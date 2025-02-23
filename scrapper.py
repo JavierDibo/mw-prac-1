@@ -11,6 +11,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Load configuration from config.ini
 config = configparser.ConfigParser()
+
+# check if config.ini exists, else raise exception with message
+if not os.path.exists('config.ini'):
+    raise Exception("\"config.ini\n file not found. Please change the name of \"config_template.ini\" file to "
+                    "\"config.ini\n after adding you public and secret spotify web API id.")
+
 config.read('config.ini')
 
 # Get spotify configuration parameters
@@ -41,7 +47,7 @@ def safe_api_call(func, *args, retries=3, delay=c_delay, **kwargs):
     """
     for i in range(retries):
         try:
-            logging.warning(f"Waiting {delay} seconds before API call...")
+            logging.info(f"Waiting {delay} seconds before API call...")
             time.sleep(delay)
             return func(*args, **kwargs)
         except spotipy.exceptions.SpotifyException as e:
