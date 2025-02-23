@@ -1,5 +1,4 @@
 from collections import deque
-
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 import csv
@@ -7,402 +6,236 @@ import time
 import os
 import logging
 import configparser
+from contextlib import contextmanager
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load configuration from config.ini
-config = configparser.ConfigParser()
 
-# check if config.ini exists, else raise exception with message
-if not os.path.exists('config.ini'):
-    raise Exception("\"config.ini\n file not found. Please change the name of \"config_template.ini\" file to "
-                    "\"config.ini\n after adding you public and secret spotify web API id.")
+class SpotifyNetworkBuilder:
+    def __init__(self, config_path='config.ini'):
+        self.config = self._load_config(config_path)
+        self.spoti = self._init_spotify()
+        self.existing_edges = set()
+        self.retry_queue = []
+        self.nodes_file = 'nodes.csv'
+        self.edges_file = 'edges.csv'
 
-config.read('config.ini')
+    def _load_config(self, config_path):
+        if not os.path.exists(config_path):
+            raise Exception(f"{config_path} file not found. Please rename config_template.ini to {config_path}")
 
-# Get spotify configuration parameters
+        config = configparser.ConfigParser()
+        config.read(config_path)
+        return config
 
-# client_id = config['spotify-uja']['client_id']
-# client_secret = config['spotify-uja']['client_secret']
-client_id = config['spotify-personal']['client_id']
-client_secret = config['spotify-personal']['client_secret']
-starting_artist = config['settings']['starting_artist']  # Get starting artist parameter
-c_limit = int(config['settings']['limit'])  # Get limit parameter
-c_times_per_second = float(config['settings']['times_per_second'])  # Get delay parameter
-c_delay = float(1 / c_times_per_second)  # Calculate delay based on times per second
+    def _init_spotify(self):
+        client_id = self.config['spotify-personal']['client_id']
+        client_secret = self.config['spotify-personal']['client_secret']
+        # client_id = self.config['spotify-uja']['client_id']
+        # client_secret = self.config['spotify-uja']['client_secret']
+        credentials = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
+        return spotipy.Spotify(client_credentials_manager=credentials)
 
-# Get depth as an integer
-depth = int(config['settings']['depth'])
+    @contextmanager
+    def _csv_writers(self):
+        """Context manager for handling CSV files."""
+        nodes_file = open(self.nodes_file, 'a', newline='', encoding='utf-8')
+        edges_file = open(self.edges_file, 'a', newline='', encoding='utf-8')
 
-#  Authenticate the client with your credentials
-credentials = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
-spoti = spotipy.Spotify(client_credentials_manager=credentials)
-
-# Set to track existing edges
-existing_edges = set()
-
-
-def safe_api_call(func, *args, retries=3, delay=c_delay, **kwargs):
-    """
-    Wrapper function to handle Spotify API calls with rate limiting and error handling.
-    """
-    for i in range(retries):
         try:
-            # logging.info(f"Waiting {delay} seconds before API call...")
-            time.sleep(delay)
-            return func(*args, **kwargs)
-        except spotipy.exceptions.SpotifyException as e:
-            if e.http_status == 429:
-                logging.warning(f"Rate limit exceeded, retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                logging.error(f"API call failed: {e}")
-                raise  # Re-raise other exceptions
-        except Exception as e:
-            logging.error(f"Unexpected error during API call: {e}")
-            raise
+            nodes_writer = csv.DictWriter(nodes_file, fieldnames=['id', 'label'])
+            edges_writer = csv.DictWriter(edges_file, fieldnames=['source', 'target'])
+            yield nodes_writer, edges_writer
+        finally:
+            nodes_file.close()
+            edges_file.close()
 
-    logging.error("Max retries exceeded for API call.")
-    raise Exception("Max retries exceeded.")
-
-
-def get_artist_data(artist_id, depth, current_depth=0, visited_artists=set()):
-    """
-    Recursively fetches artist data and collaborations up to a specified depth.
-
-    Args:
-        artist_id (str): The Spotify ID of the artist to start with.
-        depth (int): The maximum depth of recursion.
-        current_depth (int): The current depth of recursion (default: 0).
-        visited_artists (set): A set to keep track of visited artist IDs (default: set()).
-    """
-    logging.info(f"Processing artist ID: {artist_id} at depth: {current_depth}")
-
-    if artist_id in visited_artists:
-        logging.info(f"Skipping already visited artist ID: {artist_id}")
-        return
-
-    visited_artists.add(artist_id)
-
-    try:
-        artist = safe_api_call(spoti.artist, artist_id)
-        if not artist:
-            logging.warning(f"No artist found with ID: {artist_id}")
-            return
-
-        artist_name = artist['name']
-
-        artist_data = {
-            'id': artist_id,
-            'label': artist['name'],
-            # 'followers': artist['followers']['total'],
-            # 'genres': ', '.join(artist['genres']),
-            # 'popularity': artist['popularity'],
-            # 'image_url': artist['images'][0]['url'] if artist['images'] else None
-        }
-
-        # Write node data to CSV (append mode)
-        try:
-            with open('nodes.csv', 'a', newline='', encoding='utf-8') as file:
-                writer = csv.DictWriter(file, fieldnames=artist_data.keys())
-                if os.stat('nodes.csv').st_size == 0:  # Check if file is empty using os.stat
-                    writer.writeheader()
-                writer.writerow(artist_data)
-        except Exception as e:
-            logging.error(f"Error writing artist data to nodes.csv: {e}")
-
-        if current_depth >= depth:
-            logging.info(f"Reached maximum depth ({depth}) for artist ID: {artist_id}")
-            return
-
-        # Get all collaborations of the artist
-        album_types = ['album', 'single']
-        for album_type in album_types:
+    def safe_api_call(self, func, *args, retries=3, **kwargs):
+        """Enhanced API call handler with exponential backoff."""
+        delay = float(1 / float(self.config['settings']['times_per_second']))
+        for i in range(retries):
             try:
-                albums = safe_api_call(spoti.artist_albums, artist_id, album_type=album_type, limit=c_limit)
+                time.sleep(delay)
+                return func(*args, **kwargs)
+            except spotipy.exceptions.SpotifyException as e:
+                if e.http_status == 429:  # Rate limit exceeded
+                    delay *= 2  # Exponential backoff
+                    logging.warning(f"Rate limit exceeded, retrying in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    raise
+        raise Exception("Max retries exceeded.")
 
-                # Handle album pagination
-                while albums:
-                    for album in albums['items']:
-                        album_id = album['id']
+    def get_artist_collaborators(self, artist_id):
+        """Optimized collaborator fetching with batch processing."""
+        collaborators = set()
+        album_types = ['album', 'single']
+        limit = int(self.config['settings']['limit'])
 
-                        tracks = safe_api_call(spoti.album_tracks, album_id, limit=c_limit)
+        for album_type in album_types:
+            offset = 0
+            while True:
+                try:
+                    albums = self.safe_api_call(
+                        self.spoti.artist_albums,
+                        artist_id,
+                        album_type=album_type,
+                        limit=limit,
+                        offset=offset
+                    )
 
-                        # Handle track pagination
-                        while tracks:
-                            for track in tracks['items']:
-                                # Get the artists for each track
-                                for artist in track['artists']:
-                                    collaborator_id = artist['id']
+                    if not albums['items']:
+                        break
 
-                                    # Add an edge between the current artist and this one
-                                    if collaborator_id != artist_id:
-                                        # Create a sorted tuple to represent the edge (ensures A->B and B->A are treated the same)
-                                        edge_pair = tuple(sorted([artist_id, collaborator_id]))
+                    # Batch process album tracks
+                    album_ids = [album['id'] for album in albums['items']]
+                    for i in range(0, len(album_ids), 20):  # Spotify allows up to 20 albums per request
+                        batch = album_ids[i:i + 20]
+                        tracks_data = self.safe_api_call(self.spoti.albums_tracks, batch)
 
-                                        # Only process this edge if we haven't seen it before
-                                        if edge_pair not in existing_edges:
-                                            existing_edges.add(edge_pair)
+                        for album_tracks in tracks_data.values():
+                            for track in album_tracks:
+                                collaborators.update(
+                                    artist['id'] for artist in track['artists']
+                                    if artist['id'] != artist_id
+                                )
 
-                                            edge = {
-                                                'source': artist_id,
-                                                'target': collaborator_id
-                                            }
-                                            try:
-                                                with open('edges.csv', 'a', newline='', encoding='utf-8') as file:
-                                                    writer = csv.DictWriter(file, fieldnames=edge.keys())
-                                                    if os.stat('edges.csv').st_size == 0:
-                                                        writer.writeheader()
-                                                    writer.writerow(edge)
-                                            except Exception as e:
-                                                logging.error(f"Error writing edge data to edges.csv: {e}")
+                    offset += limit
+                    if offset >= albums['total']:
+                        break
 
-                                            # Recursive call to process the collaborator, increasing the depth
-                                            get_artist_data(collaborator_id, depth, current_depth + 1, visited_artists)
-                                        else:
-                                            logging.info(f"Skipping duplicate edge: {artist_id} - {collaborator_id}")
-
-                            # Go to next page of tracks
-                            if tracks['next']:
-                                tracks = safe_api_call(spoti.next, tracks)
-                            else:
-                                tracks = None
-
-                    # Go to next page of albums
-                    if albums['next']:
-                        albums = safe_api_call(spoti.next, albums)
-                    else:
-                        albums = None
-            except Exception as e:
-                logging.error(f"Error processing albums for {artist_name} (ID: {artist_id}) and type {album_type}: {e}")
-                continue
-    except Exception as e:
-        logging.error(f"Error getting artist data: {e}")
-
-
-# Initialize CSV files with headers
-try:
-    with open('nodes.csv', 'w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(['id', 'label'])  # Adjusted to match the actual columns being written
-
-    with open('edges.csv', 'w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(['source', 'target'])
-except Exception as e:
-    logging.error(f"Error initializing CSV files: {e}")
-    exit()
-
-
-def clean_data(nodes_file='nodes.csv', edges_file='edges.csv'):
-    """
-    Cleans the nodes and edges CSV files based on identified data quality issues.
-    """
-
-    cleaned_nodes = []
-    node_ids = set()  # To track unique node IDs
-    node_id_counts = {}  # Track counts of each node ID
-    with open(nodes_file, 'r', encoding='utf-8') as infile:
-        reader = csv.DictReader(infile)
-        for row in reader:
-            # Skip if any required fields are missing or empty, remove incomplete data.
-            if not all([row['id'], row['label']]):
-                print(f"Skipping row with missing id or label: {row}")
-                continue
-            if row['id'] in node_ids:
-                print(f"Skipping duplicate node ID: {row['id']}")
-                continue
-            node_ids.add(row['id'])
-
-            cleaned_nodes.append(row)
-
-            # Increment ID counts for multiple nodes
-            if row['id'] not in node_id_counts:
-                node_id_counts[row['id']] = 0
-            node_id_counts[row['id']] += 1
-
-    # Remove the last node with the duplicated ID if it exists
-    for id, count in node_id_counts.items():
-        if count > 1:
-            for i in range(len(cleaned_nodes) - 1, 0, -1):
-                if cleaned_nodes[i]['id'] == id:
-                    cleaned_nodes.pop(i)
-                    print(f"Skipping duplicated ID {id}")
+                except Exception as e:
+                    logging.error(f"Error fetching collaborators for {artist_id}: {e}")
+                    self.retry_queue.append(('collaborators', artist_id))
                     break
 
-    cleaned_edges = []
-    with open(edges_file, 'r', encoding='utf-8') as infile:
-        reader = csv.DictReader(infile)
-        for row in reader:
-            # Verify that source and target exists on the cleaned_nodes
-            if not (row['source'] in node_ids and row['target'] in node_ids):
-                print(f"Skipping edges with missing source or target ids.")
-                continue
+        return collaborators
 
-            cleaned_edges.append(row)
+    def get_artist_data_bfs(self, artist_id, max_depth):
+        """Optimized BFS traversal with progress tracking and batch processing."""
+        logging.info(f"Starting BFS traversal from artist ID: {artist_id}")
 
-    # Remove any duplicate connections between nodes
-    cleaned_edges_no_dupes = []
-    edges = set()
-    for edge in cleaned_edges:
-        edge_tuple = (edge['source'], edge['target'])
-        if edge_tuple not in edges:
-            cleaned_edges_no_dupes.append(edge)
-            edges.add(edge_tuple)
-        else:
-            print(f"Skipping duplicate edge: {edge}")
+        # Initialize tracking structures
+        queue = deque([(artist_id, 0)])
+        visited_artists = set([artist_id])
+        current_depth = 0
+        depth_artists = {0: [artist_id]}  # Track artists at each depth for progress
 
-    # Write cleaned data to new files
-    with open('cleaned_nodes.csv', 'w', newline='', encoding='utf-8') as outfile:
-        fieldnames = cleaned_nodes[0].keys() if cleaned_nodes else []
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(cleaned_nodes)
+        # Initialize CSV files
+        for filename in [self.nodes_file, self.edges_file]:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['id', 'label'] if filename == self.nodes_file else ['source', 'target'])
 
-    with open('cleaned_edges.csv', 'w', newline='', encoding='utf-8') as outfile:
-        fieldnames = cleaned_edges_no_dupes[0].keys() if cleaned_edges_no_dupes else []
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(cleaned_edges_no_dupes)
+        # Process the starting artist
+        with self._csv_writers() as (nodes_writer, edges_writer):
+            while queue:
+                batch = []
+                # Process all artists at the current depth
+                while queue and queue[0][1] == current_depth:
+                    batch.append(queue.popleft())
 
-    print("Data cleaning complete. Cleaned data written to cleaned_nodes.csv and cleaned_edges.csv")
+                if not batch:  # Move to next depth
+                    current_depth += 1
+                    if current_depth > max_depth:
+                        break
+                    continue
 
+                logging.info(f"Processing depth {current_depth} with {len(batch)} artists")
+                depth_artists[current_depth] = []
 
-def get_artist_collaborators(spoti, artist_id, c_limit):
-    """
-    Helper function to get all collaborators for a given artist.
-    Returns a set of collaborator IDs.
-    """
-    collaborators = set()
-    album_types = ['album', 'single']
+                # Process batch of artists
+                with tqdm(total=len(batch), desc=f"Depth {current_depth}") as pbar:
+                    for current_artist_id, _ in batch:
+                        try:
+                            collaborators = self.get_artist_collaborators(current_artist_id)
 
-    for album_type in album_types:
-        albums = safe_api_call(spoti.artist_albums, artist_id, album_type=album_type, limit=c_limit)
+                            for collaborator_id in collaborators:
+                                edge_pair = tuple(sorted([current_artist_id, collaborator_id]))
 
-        while albums:
-            for album in albums['items']:
-                tracks = safe_api_call(spoti.album_tracks, album['id'], limit=c_limit)
+                                if edge_pair not in self.existing_edges:
+                                    self.existing_edges.add(edge_pair)
+                                    edges_writer.writerow({
+                                        'source': current_artist_id,
+                                        'target': collaborator_id
+                                    })
 
-                while tracks:
-                    for track in tracks['items']:
-                        for artist in track['artists']:
-                            if artist['id'] != artist_id:
-                                collaborators.add(artist['id'])
+                                    if collaborator_id not in visited_artists:
+                                        visited_artists.add(collaborator_id)
+                                        collaborator = self.safe_api_call(self.spoti.artist, collaborator_id)
 
-                    tracks = safe_api_call(spoti.next, tracks) if tracks['next'] else None
+                                        if collaborator:
+                                            nodes_writer.writerow({
+                                                'id': collaborator_id,
+                                                'label': collaborator['name']
+                                            })
 
-            albums = safe_api_call(spoti.next, albums) if albums['next'] else None
+                                            if current_depth < max_depth:
+                                                queue.append((collaborator_id, current_depth + 1))
+                                                depth_artists[current_depth + 1].append(collaborator_id)
 
-    return collaborators
+                        except Exception as e:
+                            logging.error(f"Error processing artist {current_artist_id}: {e}")
+                            self.retry_queue.append(('artist', current_artist_id))
 
+                        pbar.update(1)
 
-def get_artist_data_bfs(artist_id, max_depth):
-    """
-    Traverses artist collaborations using breadth-first search up to a specified depth.
-    """
-    logging.info(f"Starting BFS traversal from artist ID: {artist_id}")
+        # Process retry queue
+        if self.retry_queue:
+            logging.info(f"Processing {len(self.retry_queue)} failed requests...")
+            self._process_retry_queue()
 
-    # Queue will store tuples of (artist_id, depth)
-    queue = deque([(artist_id, 0)])
-    visited_artists = set([artist_id])
+        return visited_artists
 
-    # Process the starting artist
-    artist = safe_api_call(spoti.artist, artist_id)
-    if not artist:
-        logging.warning(f"No artist found with ID: {artist_id}")
-        return
+    def _process_retry_queue(self):
+        """Process failed requests with increased delays."""
+        with self._csv_writers() as (nodes_writer, edges_writer):
+            for request_type, artist_id in tqdm(self.retry_queue, desc="Retrying failed requests"):
+                try:
+                    if request_type == 'artist':
+                        artist = self.safe_api_call(self.spoti.artist, artist_id, retries=5)
+                        if artist:
+                            nodes_writer.writerow({
+                                'id': artist_id,
+                                'label': artist['name']
+                            })
+                    elif request_type == 'collaborators':
+                        collaborators = self.get_artist_collaborators(artist_id)
+                        for collaborator_id in collaborators:
+                            edge_pair = tuple(sorted([artist_id, collaborator_id]))
+                            if edge_pair not in self.existing_edges:
+                                self.existing_edges.add(edge_pair)
+                                edges_writer.writerow({
+                                    'source': artist_id,
+                                    'target': collaborator_id
+                                })
+                except Exception as e:
+                    logging.error(f"Retry failed for {artist_id}: {e}")
 
-    # Write initial artist to nodes.csv
-    artist_data = {
-        'id': artist_id,
-        'label': artist['name']
-    }
+    def build_network(self):
+        """Main method to build the artist network."""
+        artist_name = self.config['settings']['starting_artist']
+        max_depth = int(self.config['settings']['depth'])
 
-    with open('nodes.csv', 'a', newline='', encoding='utf-8') as file:
-        writer = csv.DictWriter(file, fieldnames=artist_data.keys())
-        if os.stat('nodes.csv').st_size == 0:
-            writer.writeheader()
-        writer.writerow(artist_data)
-
-    # Process artists level by level
-    while queue:
-        current_artist_id, current_depth = queue.popleft()
-
-        if current_depth >= max_depth:
-            continue
-
-        # Get all collaborators for the current artist
         try:
-            collaborators = get_artist_collaborators(spoti, current_artist_id, c_limit)
+            result = self.safe_api_call(self.spoti.search, q='artist:' + artist_name, type='artist')
+            artist = result['artists']['items'][0]
+            visited_artists = self.get_artist_data_bfs(artist['id'], max_depth)
 
-            for collaborator_id in collaborators:
-                # Create a sorted tuple to represent the edge
-                edge_pair = tuple(sorted([current_artist_id, collaborator_id]))
+            print(f'Network building complete:')
+            print(f'- Visited artists: {len(visited_artists)}')
+            print(f'- Unique edges: {len(self.existing_edges)}')
+            print(f'- Failed requests: {len(self.retry_queue)}')
 
-                if edge_pair not in existing_edges:
-                    existing_edges.add(edge_pair)
-
-                    # Write edge to CSV
-                    edge = {
-                        'source': current_artist_id,
-                        'target': collaborator_id
-                    }
-                    with open('edges.csv', 'a', newline='', encoding='utf-8') as file:
-                        writer = csv.DictWriter(file, fieldnames=edge.keys())
-                        if os.stat('edges.csv').st_size == 0:
-                            writer.writeheader()
-                        writer.writerow(edge)
-
-                    # Process new collaborator if not visited
-                    if collaborator_id not in visited_artists:
-                        visited_artists.add(collaborator_id)
-
-                        # Get and write collaborator data
-                        collaborator = safe_api_call(spoti.artist, collaborator_id)
-                        if collaborator:
-                            collaborator_data = {
-                                'id': collaborator_id,
-                                'label': collaborator['name']
-                            }
-                            with open('nodes.csv', 'a', newline='', encoding='utf-8') as file:
-                                writer = csv.DictWriter(file, fieldnames=collaborator_data.keys())
-                                writer.writerow(collaborator_data)
-
-                            # Add to queue for next level processing
-                            queue.append((collaborator_id, current_depth + 1))
+            self.clean_data()
 
         except Exception as e:
-            logging.error(f"Error processing artist ID {current_artist_id}: {e}")
-            continue
-
-    return visited_artists
+            logging.error(f"Error building network: {e}")
+            raise
 
 
-# Main execution block
 if __name__ == "__main__":
-    artist_name = starting_artist
-
-    try:
-        result = safe_api_call(spoti.search, q='artist:' + artist_name, type='artist')
-        items = result['artists']['items']
-        if not items:
-            logging.warning(f"No artists found matching: {artist_name}")
-            exit()
-        artist = items[0]
-        artist_id = artist['id']
-    except Exception as e:
-        logging.error(f"Error during initial artist search: {e}")
-        exit()
-
-    # Initialize CSV files
-    for filename in ['nodes.csv', 'edges.csv']:
-        with open(filename, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(['id', 'label'] if filename == 'nodes.csv' else ['source', 'target'])
-
-    # Start the BFS traversal
-    visited_artists = get_artist_data_bfs(artist_id, depth)
-
-    print(f'DONE. Visited artists: {len(visited_artists)}, Unique edges: {len(existing_edges)}')
-    clean_data()
+    builder = SpotifyNetworkBuilder()
+    builder.build_network()
