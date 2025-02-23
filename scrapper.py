@@ -21,7 +21,8 @@ client_id = config['spotify-personal']['client_id']
 client_secret = config['spotify-personal']['client_secret']
 starting_artist = config['settings']['starting_artist']  # Get starting artist parameter
 c_limit = int(config['settings']['limit'])  # Get limit parameter
-c_delay = float(config['settings']['delay'])  # Get delay parameter
+c_times_per_second = float(config['settings']['times_per_second'])  # Get delay parameter
+c_delay = float(1 / c_times_per_second)  # Calculate delay based on times per second
 
 # Get depth as an integer
 depth = int(config['settings']['depth'])
