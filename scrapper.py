@@ -1,3 +1,5 @@
+from collections import deque
+
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 import csv
@@ -47,7 +49,7 @@ def safe_api_call(func, *args, retries=3, delay=c_delay, **kwargs):
     """
     for i in range(retries):
         try:
-            logging.info(f"Waiting {delay} seconds before API call...")
+            # logging.info(f"Waiting {delay} seconds before API call...")
             time.sleep(delay)
             return func(*args, **kwargs)
         except spotipy.exceptions.SpotifyException as e:
@@ -213,11 +215,6 @@ def clean_data(nodes_file='nodes.csv', edges_file='edges.csv'):
                 continue
             node_ids.add(row['id'])
 
-            # Remove any rows with Maka and Nano Cortes Combined
-            if row['label'] == 'Maka, Nano Cortés':
-                print(f"Skipping merged label: {row}")
-                continue
-
             cleaned_nodes.append(row)
 
             # Increment ID counts for multiple nodes
@@ -272,9 +269,118 @@ def clean_data(nodes_file='nodes.csv', edges_file='edges.csv'):
     print("Data cleaning complete. Cleaned data written to cleaned_nodes.csv and cleaned_edges.csv")
 
 
+def get_artist_collaborators(spoti, artist_id, c_limit):
+    """
+    Helper function to get all collaborators for a given artist.
+    Returns a set of collaborator IDs.
+    """
+    collaborators = set()
+    album_types = ['album', 'single']
+
+    for album_type in album_types:
+        albums = safe_api_call(spoti.artist_albums, artist_id, album_type=album_type, limit=c_limit)
+
+        while albums:
+            for album in albums['items']:
+                tracks = safe_api_call(spoti.album_tracks, album['id'], limit=c_limit)
+
+                while tracks:
+                    for track in tracks['items']:
+                        for artist in track['artists']:
+                            if artist['id'] != artist_id:
+                                collaborators.add(artist['id'])
+
+                    tracks = safe_api_call(spoti.next, tracks) if tracks['next'] else None
+
+            albums = safe_api_call(spoti.next, albums) if albums['next'] else None
+
+    return collaborators
+
+
+def get_artist_data_bfs(artist_id, max_depth):
+    """
+    Traverses artist collaborations using breadth-first search up to a specified depth.
+    """
+    logging.info(f"Starting BFS traversal from artist ID: {artist_id}")
+
+    # Queue will store tuples of (artist_id, depth)
+    queue = deque([(artist_id, 0)])
+    visited_artists = set([artist_id])
+
+    # Process the starting artist
+    artist = safe_api_call(spoti.artist, artist_id)
+    if not artist:
+        logging.warning(f"No artist found with ID: {artist_id}")
+        return
+
+    # Write initial artist to nodes.csv
+    artist_data = {
+        'id': artist_id,
+        'label': artist['name']
+    }
+
+    with open('nodes.csv', 'a', newline='', encoding='utf-8') as file:
+        writer = csv.DictWriter(file, fieldnames=artist_data.keys())
+        if os.stat('nodes.csv').st_size == 0:
+            writer.writeheader()
+        writer.writerow(artist_data)
+
+    # Process artists level by level
+    while queue:
+        current_artist_id, current_depth = queue.popleft()
+
+        if current_depth >= max_depth:
+            continue
+
+        # Get all collaborators for the current artist
+        try:
+            collaborators = get_artist_collaborators(spoti, current_artist_id, c_limit)
+
+            for collaborator_id in collaborators:
+                # Create a sorted tuple to represent the edge
+                edge_pair = tuple(sorted([current_artist_id, collaborator_id]))
+
+                if edge_pair not in existing_edges:
+                    existing_edges.add(edge_pair)
+
+                    # Write edge to CSV
+                    edge = {
+                        'source': current_artist_id,
+                        'target': collaborator_id
+                    }
+                    with open('edges.csv', 'a', newline='', encoding='utf-8') as file:
+                        writer = csv.DictWriter(file, fieldnames=edge.keys())
+                        if os.stat('edges.csv').st_size == 0:
+                            writer.writeheader()
+                        writer.writerow(edge)
+
+                    # Process new collaborator if not visited
+                    if collaborator_id not in visited_artists:
+                        visited_artists.add(collaborator_id)
+
+                        # Get and write collaborator data
+                        collaborator = safe_api_call(spoti.artist, collaborator_id)
+                        if collaborator:
+                            collaborator_data = {
+                                'id': collaborator_id,
+                                'label': collaborator['name']
+                            }
+                            with open('nodes.csv', 'a', newline='', encoding='utf-8') as file:
+                                writer = csv.DictWriter(file, fieldnames=collaborator_data.keys())
+                                writer.writerow(collaborator_data)
+
+                            # Add to queue for next level processing
+                            queue.append((collaborator_id, current_depth + 1))
+
+        except Exception as e:
+            logging.error(f"Error processing artist ID {current_artist_id}: {e}")
+            continue
+
+    return visited_artists
+
+
 # Main execution block
 if __name__ == "__main__":
-    # load the artist name parameter from the configuration file
     artist_name = starting_artist
 
     try:
@@ -289,9 +395,14 @@ if __name__ == "__main__":
         logging.error(f"Error during initial artist search: {e}")
         exit()
 
-    # Start the search process, load depth from the config file
-    visited_artists = set()
-    get_artist_data(artist_id, depth=depth, visited_artists=visited_artists)
+    # Initialize CSV files
+    for filename in ['nodes.csv', 'edges.csv']:
+        with open(filename, 'w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(['id', 'label'] if filename == 'nodes.csv' else ['source', 'target'])
+
+    # Start the BFS traversal
+    visited_artists = get_artist_data_bfs(artist_id, depth)
 
     print(f'DONE. Visited artists: {len(visited_artists)}, Unique edges: {len(existing_edges)}')
     clean_data()
