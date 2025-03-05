@@ -1,3 +1,11 @@
 spotipy
 configparser
 tqdm
+pandas
+networkx
+numpy
+matplotlib
+scikit-learn
+seaborn
+python-louvain
+warnings
