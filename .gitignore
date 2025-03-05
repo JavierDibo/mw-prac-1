@@ -1,8 +1,4 @@
 .cache
-cleaned_nodes.csv
-cleaned_edges.csv
-edges.csv
-nodes.csv
 .gitignore
 .idea
 config.ini

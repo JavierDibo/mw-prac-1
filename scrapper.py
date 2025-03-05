@@ -4,7 +4,7 @@ import csv
 import time
 import requests
 from requests.exceptions import ReadTimeout
-import os
+from collections import deque
 
 # Configure your Spotify API credentials
 client_id = '75d26023724d4e89941085b8b3c7a078'
@@ -14,94 +14,107 @@ client_secret = '4f314f8b53ab43fab6d882b61a2eb7a6'
 credentials = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
 sp = spotipy.Spotify(client_credentials_manager=credentials)
 
-# Function to check if a file is empty
-def is_file_empty(file_path):
-    return not os.path.exists(file_path) or os.stat(file_path).st_size == 0
+def process_artist(artist_name, depth):
+    # Initialize data structures
+    visited_artists = set()
+    artist_queue = deque()  # Queue of (artist_name, depth) tuples
+    artist_queue.append((artist_name, 0))
 
-def get_artist_data(artist_name, depth, current_depth=0, visited_artists=None):
-    if visited_artists is None:
-        visited_artists = set()
+    # Initialize CSV files with headers
+    with open('nodes.csv', 'w', newline='', encoding='utf-8') as file:
+        writer = csv.DictWriter(file, fieldnames=['id', 'label', 'followers', 'genres', 'popularity', 'image_url'], quoting=csv.QUOTE_ALL)
+        writer.writeheader()
 
-    try:
-        # Search for the artist by name
-        result = sp.search(q='artist:' + artist_name, type='artist')
-        items = result['artists']['items']
-        if not items:
-            return
+    with open('edges.csv', 'w', newline='', encoding='utf-8') as file:
+        writer = csv.DictWriter(file, fieldnames=['source', 'target'])
+        writer.writeheader()
 
-        # Get the first result
-        artist_info = items[0]
-        artist_id = artist_info['id']
-        artist_name_found = artist_info['name']
+    while artist_queue:
+        current_artist_name, current_depth = artist_queue.popleft()
+        
+        try:
+            # Search for artist
+            result = sp.search(q='artist:' + current_artist_name, type='artist')
+            items = result['artists']['items']
+            if not items:
+                continue
 
-        # Skip if already processed
-        if artist_id in visited_artists:
-            return
+            # Get first result
+            artist = items[0]
+            artist_id = artist['id']
+            artist_name = artist['name']
 
-        print(f'Processing: {artist_name_found}...')
-        visited_artists.add(artist_id)
+            if artist_id in visited_artists:  # Skip if already processed
+                continue
 
-        # Gather artist data
-        artist_data = {
-            'id': artist_id,
-            'label': artist_name_found,
-            'followers': artist_info['followers']['total'],
-            'genres': ', '.join(artist_info['genres']),
-            'popularity': artist_info['popularity'],
-            'image_url': artist_info['images'][0]['url'] if artist_info['images'] else None
-        }
+            print(f'Processing: {artist_name} at depth {current_depth}...')
+            visited_artists.add(artist_id)
 
-        # Append node data to CSV
-        with open('nodes.csv', 'a', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=artist_data.keys())
-            if is_file_empty('nodes.csv'):
-                writer.writeheader()
-            writer.writerow(artist_data)
-        # Stop recursion if maximum depth has been reached.
-        if current_depth >= depth:
-            return
+            # Save artist data
+            artist_data = {
+                'id': artist_id,
+                'label': artist['name'],
+                'followers': artist['followers']['total'],
+                'genres': ', '.join(artist['genres']),
+                'popularity': artist['popularity'],
+                'image_url': artist['images'][0]['url'] if artist['images'] else None
+            }
 
-        # Retrieve the artist's albums
-        albums = sp.artist_albums(artist_id, album_type='album')
-        for album in albums['items']:
-            album_id = album['id']
-            # Retrieve tracks for the album
-            tracks = sp.album_tracks(album_id)['items']
+            # Write node data
+            with open('nodes.csv', 'a', newline='', encoding='utf-8') as file:
+                writer = csv.DictWriter(file, fieldnames=artist_data.keys(), quoting=csv.QUOTE_ALL)
+                writer.writerow(artist_data)
 
-            for track in tracks:
-                # Process each artist in the track
-                for track_artist in track['artists']:
-                    # Avoid self-edges
-                    if track_artist['id'] != artist_id:
-                        edge = {
-                            'source': artist_id,
-                            'target': track_artist['id']
-                        }
-                        with open('edges.csv', 'a', newline='', encoding='utf-8') as file:
-                            writer = csv.DictWriter(file, fieldnames=edge.keys())
-                            if is_file_empty('edges.csv'):
-                                writer.writeheader()
-                            writer.writerow(edge)
+            # If at max depth, skip getting collaborators
+            if current_depth >= depth:
+                continue
 
-                    # Recursive call using the track artist's name.
-                    # Note: Consider modifying this to use the artist ID to ensure accuracy.
-                    get_artist_data(track_artist['name'], depth, current_depth + 1, visited_artists)
+            # Process all albums
+            albums = sp.artist_albums(artist_id, album_type='album')
+            processed_collaborators = set()  # Track collaborators for this artist
 
-                    time.sleep(0.5)  # Pause between API calls
+            for album in albums['items']:
+                # Get all tracks
+                tracks = sp.album_tracks(album['id'])['items']
 
-    except ReadTimeout:
-        print(f"Timeout processing {artist_name_found}. Retrying...")
-        time.sleep(2)
-        get_artist_data(artist_name, depth, current_depth, visited_artists)
-    except requests.exceptions.RequestException as e:
-        print(f"Request error processing {artist_name_found}: {e}")
-        time.sleep(2)
-        get_artist_data(artist_name, depth, current_depth, visited_artists)
+                for track in tracks:
+                    # Process each collaborator
+                    for collab_artist in track['artists']:
+                        collab_id = collab_artist['id']
+                        
+                        # Skip if same artist or already processed this collaboration
+                        if collab_id != artist_id and collab_id not in processed_collaborators:
+                            processed_collaborators.add(collab_id)
+                            
+                            # Save edge
+                            edge = {
+                                'source': artist_id,
+                                'target': collab_id
+                            }
+                            with open('edges.csv', 'a', newline='', encoding='utf-8') as file:
+                                writer = csv.DictWriter(file, fieldnames=edge.keys())
+                                writer.writerow(edge)
+                            
+                            # Add collaborator to queue for next level
+                            artist_queue.append((collab_artist['name'], current_depth + 1))
 
-# Start the process
-artist_name = "Lola Indigo"  # Change this as needed
-depth = 2  # Be cautious with API limits
-visited_artist = set()
-get_artist_data(artist_name, depth=depth, visited_artists=visited_artist)
+                time.sleep(0.5)  # Rate limiting
 
-print(f'Finished. Artists visited: {len(visited_artist)}')
+        except ReadTimeout:
+            print(f"Timeout processing {current_artist_name}. Retrying...")
+            time.sleep(2)
+            artist_queue.appendleft((current_artist_name, current_depth))  # Put back in queue to retry
+
+        except requests.exceptions.RequestException as e:
+            print(f"Request error processing {current_artist_name}: {e}")
+            time.sleep(2)
+            artist_queue.appendleft((current_artist_name, current_depth))  # Put back in queue to retry
+
+    return visited_artists
+
+# Start the search process
+artist_name = "Travis Scott"  # Change this to your favorite artist
+depth = 2  # Be careful with Spotify API Limits!!
+visited_artists = process_artist(artist_name, depth)
+
+print(f'DONE. Artists visited: {len(visited_artists)}')
