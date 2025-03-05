@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import SpectralClustering
 import seaborn as sns
-from community import best_partition
+from community.community_louvain import best_partition
 import warnings
 warnings.filterwarnings('ignore')
 
